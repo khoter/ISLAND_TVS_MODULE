@@ -38,7 +38,7 @@ Bounce bOUT, bUI, bDEW, bDEP, bRU;
 #define LED_UI  2
 #define LED_DEW 3
 #define LED_DEP 4
-#define LED_RU  36   // <- добавили RU
+#define LED_RU  36
 
 // --------- LED_POT ----------
 #define LED_U 41
@@ -48,7 +48,7 @@ Bounce bOUT, bUI, bDEW, bDEP, bRU;
 const uint32_t SELFTEST_MS  = 600;
 const float    ALPHA        = 0.05f;      // EMA сглаживание АЦП
 const float    MAX_I_A      = 9.99f;
-const float    MAX_U_V      = 40.0f;      // максимум 40.0 В
+const float    MAX_U_V      = 40.0f;
 const float    MAX_P_W      = 800.0f;
 
 // гистерезис индикации
@@ -57,11 +57,28 @@ const float II_EPS_A = 0.02f;
 const int   PP_EPS_W = 2;
 
 // RGB фазы
-const uint32_t WARMUP_MS    = 10000;      // 10 секунд: красный→тёплый жёлтый
-const float    WHITE_AT_A   = 6.0f;       // белый к 6 А (ручка тока)
+const uint32_t WARMUP_MS    = 10000;      // время разогрева 
+const float    WHITE_AT_A   = 6.0f;       // макс управляющий ток к «белому»
+
+// ===== TM1637 helpers =====
+const uint8_t SEG_BLK = 0x00;
+
+//      A
+//     ---
+//  F |   | B
+//     -G-
+//  E |   | C
+//     ---
+//      D
+const uint8_t SEG_ERR1[] = {
+  (uint8_t)(SEG_A | SEG_D | SEG_E | SEG_F | SEG_G), // E
+  (uint8_t)(SEG_E | SEG_G),                         // r
+  (uint8_t)(SEG_E | SEG_G),                         // r
+  (uint8_t)(SEG_B | SEG_C)                          // 1
+};
 
 // ===== Состояния =====
-enum State { ST_INIT=0, ST_READY, ST_SETUP_I, ST_SETUP_P, ST_ARMED, ST_RUN };
+enum State { ST_INIT=0, ST_READY, ST_SETUP_I, ST_SETUP_P, ST_ARMED, ST_RUN, ST_ERR1 };
 State state = ST_INIT;
 
 // Фильтры/уставки
@@ -78,27 +95,32 @@ uint32_t tStart=0, depTime=0;
 // Флаги перерисовки
 bool forceRedraw_IU=false;
 
+// Настройки ошибки ERR1
+const float DI_DT_LIMIT_A_PER_S = 0.5f;
+float    rate_lastI  = 0.0f;
+uint32_t rate_lastMs = 0;
+bool     errActive   = false;
+
 // ===== Утилиты =====
 static inline void setLed(uint8_t pin,bool on){ pinMode(pin,OUTPUT); digitalWrite(pin, on?HIGH:LOW); }
 static inline float readADCnorm(int pin){ return analogRead(pin)/4095.0f; }
-static inline float mapU(float x){ return x*MAX_U_V; }        // 0..40.0 В
-static inline float mapP(float x){ return x*MAX_P_W; }        // 0..800 Вт
-static inline float mapI_full(float x){ return x*MAX_I_A; }   // 0..9.99 А
+static inline float mapU(float x){ return x*MAX_U_V; }
+static inline float mapP(float x){ return x*MAX_P_W; }
+static inline float mapI_full(float x){ return x*MAX_I_A; }
 static inline float smooth01(float t){ t = constrain(t,0.0f,1.0f); return t*t*(3.0f-2.0f*t); }
 static inline uint8_t u8(int v){ if(v<0)v=0; if(v>255)v=255; return (uint8_t)v; }
 
-// ===== RGB (работаем в RGB, чтобы не «зеленило») =====
+// ===== RGB =====
 #define RGB_R 5
 #define RGB_G 6
 #define RGB_B 7
 #define RGB_COMMON_ANODE 0
 #define RGB_GAMMA 2.2f
 #define RGB_SCALE_R 1.00f
-#define RGB_SCALE_G 0.60f   // сильно приглушаем зелёный глобально
+#define RGB_SCALE_G 0.60f
 #define RGB_SCALE_B 0.90f
 
 static void rgbWriteRaw(uint8_t r,uint8_t g,uint8_t b){
-  // гамма-коррекция + масштабирование зелёного
   auto gfix=[&](uint8_t v)->uint8_t{ float x=v/255.0f; x=powf(x,1.0f/RGB_GAMMA); return u8(lroundf(x*255.0f)); };
   uint8_t R=gfix(r), G=gfix((uint8_t)lroundf(g*RGB_SCALE_G)), B=gfix(b);
 #if RGB_COMMON_ANODE
@@ -107,7 +129,6 @@ static void rgbWriteRaw(uint8_t r,uint8_t g,uint8_t b){
   ledcWrite(0,R); ledcWrite(1,G); ledcWrite(2,B);
 }
 
-// linear mix two RGB colors (0..255)
 static inline void mixRGB(uint8_t r1,uint8_t g1,uint8_t b1,
                           uint8_t r2,uint8_t g2,uint8_t b2,
                           float t, uint8_t& r,uint8_t& g,uint8_t& b){
@@ -117,32 +138,31 @@ static inline void mixRGB(uint8_t r1,uint8_t g1,uint8_t b1,
   b = u8(lroundf(b1 + (b2 - b1)*t));
 }
 
-// Фаза 1 (0..10с): R(255,0,0) → Ywarm(255,110,0) — без зелени.
-// Фаза 2 (>10с): base=Ywarm → белый(255,255,255) по току 0..6 A (smoothstep + EMA).
-static float ti_ema = 0.0f;           // сглаживание обратной связи по току
-const  float TI_ALPHA = 0.12f;        // чем меньше — тем плавнее
+// Фаза 2: base=Ywarm → белый по току 0..6A (smoothstep + EMA).
+static float ti_ema = 0.0f;
+const  float TI_ALPHA = 0.12f;
 
 static void rgbRun(uint32_t ms_since_dep, float i_amp){
   const uint8_t Rr=200, Rg=0,   Rb=0;
-  const uint8_t Yr=200, Yg=0, Yb=0;     // Тупо желтый
   const uint8_t Wr=250, Wg=100, Wb=5;
 
-
-  // Фаза 2: доля к белому по току 0..6A
   float ti = constrain(i_amp / WHITE_AT_A, 0.1f, 1.0f);
-  ti = smooth01(ti);                   // плавнее
-  // EMA сглаживание, чтобы ручка не давала рывков
+  ti = smooth01(ti);
   ti_ema = (1.0f - TI_ALPHA)*ti_ema + TI_ALPHA*ti;
 
   uint8_t r,g,b; mixRGB(Rr,Rg,Rb, Wr,Wg,Wb, ti_ema, r,g,b);
   rgbWriteRaw(r,g,b);
 }
 
-// ===== TM1637 helpers =====
-const uint8_t SEG_BLK= 0x00;
-
+// ===== Отрисовка TM1637 =====
 static inline void showZerosU(){ uint8_t z[4]={dispU.encodeDigit(0),dispU.encodeDigit(0),dispU.encodeDigit(0),dispU.encodeDigit(0)}; dispU.setSegments(z); }
+static inline void show3ZerosU(){ uint8_t s[4]={ SEG_BLK, dispU.encodeDigit(0), dispU.encodeDigit(0), dispU.encodeDigit(0) }; dispU.setSegments(s); }
 static inline void showZerosL(){ uint8_t z[4]={dispL.encodeDigit(0),dispL.encodeDigit(0),dispL.encodeDigit(0),dispL.encodeDigit(0)}; dispL.setSegments(z); }
+
+static inline void showERR1Both(bool on){
+  if(on){ dispU.setSegments(SEG_ERR1); dispL.setSegments(SEG_ERR1); }
+  else  { uint8_t z[4]={SEG_BLK,SEG_BLK,SEG_BLK,SEG_BLK}; dispU.setSegments(z); dispL.setSegments(z); }
+}
 
 // U: XX.X
 static void showU(float volts){
@@ -159,6 +179,21 @@ static void showU(float volts){
   s[0]=SEG_BLK;
   s[1]=dispU.encodeDigit(d2);
   s[2]=(uint8_t)(dispU.encodeDigit(d1) | 0x80);
+  s[3]=dispU.encodeDigit(d0);
+  dispU.setSegments(s);
+}
+
+// U: X.XX как функция I: от 0.10 до 0.40 при 0..9.99 A
+static void showU_I(float amps){
+  if(amps<0) amps=0; if(amps>MAX_I_A) amps=MAX_I_A;
+  float minV = 0.10f, maxV = 0.40f;
+  float v_f = (amps>0) ? (minV + (amps / MAX_I_A) * (maxV - minV)) : 0.0f;
+  int v = (int)lroundf(v_f * 100.0f);  // 0.37 -> 37
+  int d0=v%10; v/=10; int d1=v%10; v/=10; int d2=v%10;
+  uint8_t s[4];
+  s[0]=SEG_BLK;
+  s[1]=(uint8_t)(dispU.encodeDigit(d2) | 0x80);  // целые U + точка
+  s[2]=dispU.encodeDigit(d1);
   s[3]=dispU.encodeDigit(d0);
   dispU.setSegments(s);
 }
@@ -209,7 +244,8 @@ void setup(){
   pinMode(BTN_DEP,INPUT_PULLUP); bDEP.attach(BTN_DEP); bDEP.interval(10);
   pinMode(BTN_RU ,INPUT_PULLUP); bRU.attach(BTN_RU ); bRU.interval(10);
 
-  setLed(LED_OUT,1); setLed(LED_UI,1); setLed(LED_DEW,1); setLed(LED_DEP,1); setLed(LED_RU,1); setLed(LED_U,1); setLed(LED_P,1);
+  setLed(LED_OUT,1); setLed(LED_UI,1); setLed(LED_DEW,1); setLed(LED_DEP,1); setLed(LED_RU,1);
+  setLed(LED_U,1);   setLed(LED_P,1);
 
   ledcSetup(0,5000,8); ledcAttachPin(RGB_R,0);
   ledcSetup(1,5000,8); ledcAttachPin(RGB_G,1);
@@ -220,8 +256,6 @@ void setup(){
   analogSetPinAttenuation(POT_I, ADC_11db);
   analogSetPinAttenuation(POT_U, ADC_11db);
   analogSetPinAttenuation(POT_P, ADC_11db);
-
-  // если по P шум — убери строку ниже
   pinMode(POT_P, INPUT_PULLDOWN);
   pinMode(POT_I, INPUT);
   pinMode(POT_U, INPUT);
@@ -229,7 +263,6 @@ void setup(){
   dispU.setBrightness(7,true);
   dispL.setBrightness(7,true);
 
-  // тест «8888» → «0000»
   uint8_t all8U[4]={dispU.encodeDigit(8),dispU.encodeDigit(8),dispU.encodeDigit(8),dispU.encodeDigit(8)};
   uint8_t all8L[4]={dispL.encodeDigit(8),dispL.encodeDigit(8),dispL.encodeDigit(8),dispL.encodeDigit(8)};
   dispU.setSegments(all8U); dispL.setSegments(all8L);
@@ -243,7 +276,6 @@ void setup(){
 // ===== LOOP =====
 void loop(){
   bOUT.update(); bUI.update(); bDEW.update(); bDEP.update(); bRU.update();
-
   uint32_t now=millis();
 
   if(state==ST_INIT){
@@ -255,8 +287,8 @@ void loop(){
   filtU=filtU*(1-ALPHA)+readADCnorm(POT_U)*ALPHA;
   filtP=filtP*(1-ALPHA)+readADCnorm(POT_P)*ALPHA;
 
-  // —— ГЛОБАЛЬНЫЕ быстрые входы (фиксатор): OUT → SETUP_I, UI → SETUP_P (кроме RUN)
-  if(state!=ST_RUN){
+  // быстрые входы блокируем в RUN и в ERR1
+  if(state!=ST_RUN && state!=ST_ERR1){
     if(digitalRead(BTN_OUT)==LOW && state!=ST_SETUP_I){
       setLed(LED_OUT,0);
       state=ST_SETUP_I;
@@ -283,25 +315,23 @@ void loop(){
         showI(setI_amp);  shownI=setI_amp;
         forceRedraw_IU=false;
       } else {
-        if (fabs(setU_volt - shownU) > UI_EPS_V) { shownU = setU_volt; showU(shownU); }
-        if (fabs(setI_amp - shownI) > II_EPS_A)  { shownI = setI_amp; showI(shownI); }
+        if (fabsf(setU_volt - shownU) > UI_EPS_V) { shownU = setU_volt; showU(shownU); }
+        if (fabsf(setI_amp - shownI) > II_EPS_A)  { shownI = setI_amp; showI(shownI); }
       }
 
-      // короткое нажатие UI — перейти к мощности
       if (bUI.fell()){
         setLed(LED_UI,0);
-        showZerosU(); showZerosL();
+        show3ZerosU(); showZerosL();        // в UI три нуля сверху
         state=ST_SETUP_P; shownP=-10000;
       }
     } break;
 
     case ST_SETUP_P: {
       setP_watt = constrain(mapP(filtP), 0.0f, MAX_P_W);
-      showZerosU();
+      show3ZerosU();                        // в UI три нуля
       int pInt = (int)lroundf(setP_watt);
       if (abs(pInt - shownP) > PP_EPS_W) { shownP = pInt; showP(shownP); }
 
-      // когда OUT и UI отпущены — в ARMED
       if(digitalRead(BTN_OUT)==HIGH && digitalRead(BTN_UI)==HIGH){
         setLed(LED_OUT,1); setLed(LED_UI,1);
         shownU=-1e9f; shownI=-1e9f;
@@ -311,60 +341,79 @@ void loop(){
     } break;
 
     case ST_ARMED: {
-      if (fabs(setU_volt - shownU) > UI_EPS_V) { shownU = setU_volt; showU(shownU); }
-      if (fabs(setI_amp - shownI) > II_EPS_A)  { shownI = setI_amp; showI(shownI); }
+      if (fabsf(setU_volt - shownU) > UI_EPS_V) { shownU = setU_volt; showU(shownU); }
+      if (fabsf(setI_amp - shownI) > II_EPS_A)  { shownI = setI_amp; showI(shownI); }
 
       if(bDEP.fell()){
-        setLed(LED_DEP,0);
-        setLed(LED_U,0);
-        setLed(LED_P,0);
+        setLed(LED_DEP,0); setLed(LED_U,0); setLed(LED_P,0);
         depTime=now;
-        showZerosU();            // во время DEP верхний всегда "0000"
-        showI(setI_amp);         // низ — выставленный ток
-        ti_ema = 0.0f;           // сброс плавности
-        rgbRun(setI_amp, 0.0f);         // старт прогрева
+        showU_I(setI_amp);                   // верхний: U от I (начало DEP)
+        showI(setI_amp);                     // низ — выставленный ток
+        ti_ema = 0.0f;
+        rgbRun(0, setI_amp);                
         state=ST_RUN;
+
+        // открыть трекер скорости
+        rate_lastI = setI_amp;
+        rate_lastMs = now;
+        errActive = false;
       }
     } break;
 
     case ST_RUN: {
-      // Надёжный выход: если DEP отпущена по уровню — выходим из RUN
       if (digitalRead(BTN_DEP)==HIGH || bDEP.rose()){
-        setLed(LED_DEP,1);
-        setLed(LED_U,1);
-        setLed(LED_P,1);
+        setLed(LED_DEP,1); setLed(LED_U,1); setLed(LED_P,1);
         rgbWriteRaw(0,0,0);
         state=ST_ARMED;
         break;
       }
 
-      // верхний всегда "0000" пока держим DEP
-      showZerosU();
-
-      // нижний — текущий ток (X.XX)
       float iFull=constrain(mapI_full(filtI),0.0f,MAX_I_A);
       float iView=roundf(iFull*100.0f)/100.0f;
-      if (fabs(iView - shownI) > II_EPS_A) { shownI = iView; showI(iView); }
-
-      // RGB: 10с по времени; затем — к белому по току 0..6A, плавно и без зелени
+      if (fabsf(iView - shownI) > II_EPS_A) { shownI = iView; showI(iView); }
+      showU_I(iView);                        // верхний — U от I
       rgbRun(now - depTime, iFull);
+
+      // контроль скорости нарастания тока
+      uint32_t dt_ms = now - rate_lastMs;
+      if (dt_ms > 0){
+        float di = fabsf(iFull - rate_lastI);
+        float rate = di / (dt_ms * 0.001f);  // A/с
+        if (rate > DI_DT_LIMIT_A_PER_S){
+          errActive = true;
+          rgbWriteRaw(0,0,0);
+          setLed(LED_U,1); setLed(LED_P,1); setLed(LED_DEP,1);
+          state = ST_ERR1;
+          break;
+        }
+      }
+      rate_lastI = iFull;
+      rate_lastMs = now;
+    } break;
+
+    case ST_ERR1: {
+      bool blinkOn = ((now / 500) % 2) == 0; // 1 Гц (500 мс вкл/выкл)
+      showERR1Both(blinkOn);
+      // Выход только физическим RST (перезагрузка МК)
     } break;
 
     default: break;
   }
 
-  // === Нули только когда ВСЕ кнопки отпущены ===
-  if (readButtonsMask() == 0) {
+  // Нули только в режиме готовности и когда отпущены все кнопки
+  if (state == ST_READY && readButtonsMask() == 0) {
     showZerosU();
     showZerosL();
   }
 
-  // === Управление ВСЕМИ 5 дискретными LED ===
-  setLed(LED_OUT, digitalRead(BTN_OUT)==LOW ? 0:1);
-  setLed(LED_UI,  digitalRead(BTN_UI )==LOW ? 0:1);
-  setLed(LED_DEW, digitalRead(BTN_DEW)==LOW ? 0:1);
-  setLed(LED_DEP, digitalRead(BTN_DEP)==LOW ? 0:1);
-  setLed(LED_RU,  digitalRead(BTN_RU )==LOW ? 0:1);
-  setLed(LED_U,  digitalRead(BTN_DEP )==LOW ? 0:1);
-  setLed(LED_P,  digitalRead(BTN_DEP )==LOW ? 0:1);
+  // Управление LED (не трогаем в аварии)
+  if (state != ST_ERR1){
+    setLed(LED_OUT, digitalRead(BTN_OUT)==LOW ? 0:1);
+    setLed(LED_UI,  digitalRead(BTN_UI )==LOW ? 0:1);
+    setLed(LED_DEW, digitalRead(BTN_DEW)==LOW ? 0:1);
+    setLed(LED_DEP, digitalRead(BTN_DEP )==LOW ? 0:1);
+    setLed(LED_RU,  digitalRead(BTN_RU )==LOW ? 0:1);
+    setLed(LED_U,   digitalRead(BTN_DEP )==LOW ? 0:1);
+    setLed(LED_P,   digitalRead(BTN_DEP )==LOW ? 0:1);
+  }
 }
