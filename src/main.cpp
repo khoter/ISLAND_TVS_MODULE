@@ -96,7 +96,7 @@ uint32_t tStart=0, depTime=0;
 bool forceRedraw_IU=false;
 
 // Настройки ошибки ERR1
-const float DI_DT_LIMIT_A_PER_S = 0.5f;
+const float DI_DT_LIMIT_A_PER_S = 1.0f;
 float    rate_lastI  = 0.0f;
 uint32_t rate_lastMs = 0;
 bool     errActive   = false;
